@@ -161,15 +161,23 @@ public static class KernelPthreadCompatExports
 
     static KernelPthreadCompatExports()
     {
-        GuestThreadExecution.GuestThreadAbandoned += AbandonMutexesOwnedByThread;
+        GuestThreadExecution.GuestThreadAbandoned += AbandonMutexesForThread;
     }
 
     /// <summary>
-    /// Force-release mutexes still owned by a guest thread that is being torn
-    /// down without a clean unlock (TBB worker_abort, abrupt exit). Otherwise
-    /// waiters can spin forever and block splash→first GPU submit.
+    /// Detaches a guest thread that is being torn down without unwinding (TBB
+    /// worker_abort, abrupt exit) from every mutex it touches: force-releases
+    /// the ones it owns, and drops it from the waiter FIFOs it is parked in.
+    /// Otherwise waiters can spin forever and block splash→first GPU submit.
     /// </summary>
-    public static int AbandonMutexesOwnedByThread(ulong threadId, string reason)
+    /// <remarks>
+    /// Dropping it from waiter FIFOs is not optional. The worker is killed with
+    /// TerminateThread, so the <c>finally</c> that would normally dequeue it
+    /// never runs, and a hand-off to that dead handle would assign ownership to
+    /// a thread that can never unlock — wedging the mutex permanently rather
+    /// than merely leaving a stale entry.
+    /// </remarks>
+    public static int AbandonMutexesForThread(ulong threadId, string reason)
     {
         if (threadId == 0)
         {
@@ -177,13 +185,37 @@ public static class KernelPthreadCompatExports
         }
 
         var released = 0;
+        var dequeued = 0;
         foreach (var pair in _mutexStates)
         {
             var state = pair.Value;
             lock (state)
             {
+                // Drop any parked-waiter registration first, so the hand-off
+                // below cannot pick this dying thread as the next owner.
+                for (var node = state.WaiterQueue.First; node is not null;)
+                {
+                    var next = node.Next;
+                    if (node.Value == threadId)
+                    {
+                        state.WaiterQueue.Remove(node);
+                        state.WaiterRemovedLocked();
+                        dequeued++;
+                    }
+
+                    node = next;
+                }
+
                 if (state.OwnerThreadId != threadId || state.RecursionCount <= 0)
                 {
+                    // Still pulse if we removed an entry: a thread parked behind
+                    // the one we just dropped may now be at the head of a free
+                    // mutex and can claim it.
+                    if (dequeued > 0 && state.QueuedWaiterCount != 0)
+                    {
+                        Monitor.PulseAll(state);
+                    }
+
                     continue;
                 }
 
@@ -203,8 +235,16 @@ public static class KernelPthreadCompatExports
             }
         }
 
-        if (released > 0)
+        if (released > 0 || dequeued > 0)
         {
+            if (dequeued > 0)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] pthread_mutex_abandon_waiter " +
+                    $"thread={KernelPthreadState.DescribeThreadHandle(threadId)} " +
+                    $"reason={reason} dequeued={dequeued}");
+            }
+
             Console.Error.Flush();
         }
 
@@ -917,6 +957,24 @@ public static class KernelPthreadCompatExports
             // waiter count afterwards, so either it observes this increment and
             // takes the hand-off path, or the loop below observes its release
             // and never parks.
+            // A thread has at most one pending acquisition on a mutex: it is
+            // either running or parked on exactly one wait. An entry for this
+            // thread that is still queued as it comes back for a fresh
+            // acquisition is therefore a leftover from a teardown that never
+            // unwound and never reached the abandon hook. Prune it — left at the
+            // head it would take a hand-off no live thread is waiting for.
+            for (var stale = state.WaiterQueue.First; stale is not null;)
+            {
+                var next = stale.Next;
+                if (stale.Value == currentThreadId)
+                {
+                    state.WaiterQueue.Remove(stale);
+                    state.WaiterRemovedLocked();
+                }
+
+                stale = next;
+            }
+
             var queueNode = state.WaiterQueue.AddLast(currentThreadId);
             state.WaiterAddedLocked();
             var acquired = false;
@@ -930,6 +988,17 @@ public static class KernelPthreadCompatExports
                         // recursion and dequeued us as one step under this monitor.
                         acquired = true;
                         break;
+                    }
+
+                    // An abandon sweep drops this thread's registration on the
+                    // assumption it is being torn down. If it is in fact still
+                    // running, re-register rather than park forever: off the
+                    // queue it can never be at the head, so no hand-off and no
+                    // self-claim would ever reach it.
+                    if (queueNode.List is null)
+                    {
+                        queueNode = state.WaiterQueue.AddLast(currentThreadId);
+                        state.WaiterAddedLocked();
                     }
 
                     // A free mutex with a queued waiter is reachable: the
@@ -962,7 +1031,10 @@ public static class KernelPthreadCompatExports
             }
             finally
             {
-                if (!acquired)
+                // The node is already detached when the releaser handed the mutex
+                // over, or when an abandon sweep dropped it; removing it again
+                // would throw.
+                if (!acquired && queueNode.List is not null)
                 {
                     state.WaiterQueue.Remove(queueNode);
                 }
@@ -1622,7 +1694,18 @@ public static class KernelPthreadCompatExports
 
         // POSIX guarantees the mutex is re-acquired on every return path,
         // signaled or timed out. Blocks in place like any other locker.
-        _ = PthreadMutexLockCore(ctx, mutexAddress, tryOnly: false);
+        //
+        // The result cannot be discarded: re-acquisition genuinely fails when
+        // teardown unwinds the wait (TRY_AGAIN) or the mutex was destroyed while
+        // we were parked (NOT_FOUND). Reporting success there would send the
+        // guest back into its critical section holding nothing, and its matching
+        // unlock would then fail against a mutex it never owned.
+        var relockResult = PthreadMutexLockCore(ctx, mutexAddress, tryOnly: false);
+        if (relockResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            TracePthreadCond("wait-relock-fail", condAddress, mutexAddress, state, timed, relockResult);
+            return relockResult;
+        }
 
         var waitResult = signaled || !timed
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
