@@ -5020,6 +5020,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						break;
 				}
 			}
+
+			// Release whatever synchronization state the thread left behind, now
+			// that the gate is released: the cleanup takes per-mutex locks and may
+			// wake blocked threads, mirroring pthread_mutex_unlock. Both terminal
+			// states qualify — a faulted thread will not unlock either, and a
+			// stranded owner or waiter wedges that mutex forever.
+			GuestThreadExecution.NotifyGuestThreadExited(thread.ThreadHandle);
+
 			if (_logGuestThreads)
 			{
 				Console.Error.WriteLine(

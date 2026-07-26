@@ -162,6 +162,12 @@ public static class KernelPthreadCompatExports
     static KernelPthreadCompatExports()
     {
         GuestThreadExecution.GuestThreadAbandoned += AbandonMutexesForThread;
+
+        // Abrupt worker-abort is not the only way a thread leaves a mutex
+        // stranded: one that simply returns (or faults) while still owning it
+        // never unlocks either.
+        GuestThreadExecution.GuestThreadExited +=
+            threadHandle => AbandonMutexesForThread(threadHandle, "thread_exit");
     }
 
     /// <summary>
@@ -186,13 +192,24 @@ public static class KernelPthreadCompatExports
 
         var released = 0;
         var dequeued = 0;
+
+        // _mutexStates maps both the guest address and the opaque handle to the
+        // same state instance, so dedupe on the object to visit each mutex once
+        // — otherwise a release is counted twice.
+        var visited = new HashSet<PthreadMutexState>(ReferenceEqualityComparer.Instance);
         foreach (var pair in _mutexStates)
         {
             var state = pair.Value;
+            if (!visited.Add(state))
+            {
+                continue;
+            }
+
             lock (state)
             {
                 // Drop any parked-waiter registration first, so the hand-off
                 // below cannot pick this dying thread as the next owner.
+                var dequeuedHere = 0;
                 for (var node = state.WaiterQueue.First; node is not null;)
                 {
                     var next = node.Next;
@@ -200,38 +217,37 @@ public static class KernelPthreadCompatExports
                     {
                         state.WaiterQueue.Remove(node);
                         state.WaiterRemovedLocked();
-                        dequeued++;
+                        dequeuedHere++;
                     }
 
                     node = next;
                 }
 
-                if (state.OwnerThreadId != threadId || state.RecursionCount <= 0)
-                {
-                    // Still pulse if we removed an entry: a thread parked behind
-                    // the one we just dropped may now be at the head of a free
-                    // mutex and can claim it.
-                    if (dequeued > 0 && state.QueuedWaiterCount != 0)
-                    {
-                        Monitor.PulseAll(state);
-                    }
+                dequeued += dequeuedHere;
 
-                    continue;
+                if (state.OwnerThreadId == threadId && state.RecursionCount > 0)
+                {
+                    state.OwnerThreadId = 0;
+                    state.RecursionCount = 0;
+                    released++;
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] pthread_mutex_abandon mutex=0x{pair.Key:X16} " +
+                        $"owner={KernelPthreadState.DescribeThreadHandle(threadId)} " +
+                        $"reason={reason} waiters={state.QueuedWaiterCount}");
                 }
 
-                state.OwnerThreadId = 0;
-                state.RecursionCount = 0;
-
-                // Must hand off, not merely wake: parked waiters wait to be given
-                // ownership, so abandoning the mutex as "free" would strand every
-                // one of them. The hand-off pulse is the whole wake — no wake-key
-                // round trip through the scheduler is needed.
-                HandOffMutexLocked(state);
-                released++;
-                Console.Error.WriteLine(
-                    $"[LOADER][WARN] pthread_mutex_abandon mutex=0x{pair.Key:X16} " +
-                    $"owner={KernelPthreadState.DescribeThreadHandle(threadId)} " +
-                    $"reason={reason} waiters={state.QueuedWaiterCount}");
+                // Hand off whenever the mutex ended up free with someone queued —
+                // whether we just released it, or we dropped a dead head that was
+                // holding up a survivor. Parked waiters wait to be *given*
+                // ownership, so leaving it merely "free" would strand them.
+                if (state.OwnerThreadId == 0 && state.WaiterQueue.First is not null)
+                {
+                    HandOffMutexLocked(state);
+                }
+                else if (dequeuedHere > 0 && state.QueuedWaiterCount != 0)
+                {
+                    Monitor.PulseAll(state);
+                }
             }
         }
 

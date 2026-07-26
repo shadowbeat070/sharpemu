@@ -182,6 +182,33 @@ public static class GuestThreadExecution
     /// </summary>
     public static event Func<ulong, string, int>? GuestThreadAbandoned;
 
+    /// <summary>
+    /// Fired once a guest thread reaches a terminal state through the normal
+    /// executor path, so kernel primitives can release anything it still held.
+    /// Distinct from <see cref="GuestThreadAbandoned"/>, which covers only the
+    /// abrupt worker-abort teardown: a thread that simply returns while still
+    /// owning a mutex strands it just as thoroughly.
+    /// </summary>
+    public static event Action<ulong>? GuestThreadExited;
+
+    /// <summary>Raises <see cref="GuestThreadExited"/>. Safe with a zero handle (no-op).</summary>
+    public static void NotifyGuestThreadExited(ulong threadHandle)
+    {
+        if (threadHandle == 0 || GuestThreadExited is null)
+        {
+            return;
+        }
+
+        try
+        {
+            GuestThreadExited.Invoke(threadHandle);
+        }
+        catch
+        {
+            // Teardown notification is best-effort; never let it fault the executor.
+        }
+    }
+
     public static int NotifyGuestThreadAbandoned(ulong threadHandle, string reason)
     {
         if (threadHandle == 0 || GuestThreadAbandoned is null)
