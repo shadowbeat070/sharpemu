@@ -33,6 +33,16 @@ public static class GuestThreadBlocking
     /// <summary>Called by the execution backend when guest execution is being torn down.</summary>
     public static void RequestShutdown() => _shutdownRequested = true;
 
+    /// <summary>
+    /// Clears the teardown flag so a fresh session can park again. Without this
+    /// the flag is set-only and process-wide: once any guest has torn down,
+    /// every later in-place wait — mutex, condvar, semaphore, event flag, event
+    /// queue, sync-on-address — unwinds immediately instead of blocking. The
+    /// backend calls this when it installs itself for a new execution, which is
+    /// the point at which the previous guest has fully left.
+    /// </summary>
+    public static void ResetShutdown() => _shutdownRequested = false;
+
     /// <summary>Records what the given guest thread is about to park on (diagnostics only).</summary>
     public static void NoteBlocked(ulong guestThreadHandle, string description)
     {
@@ -90,13 +100,18 @@ public static class GuestThreadBlocking
     /// </summary>
     public static void Checkpoint(ulong guestThreadHandle, object gate)
     {
-        if (_interrupted.IsEmpty || guestThreadHandle == 0 || !_interrupted.TryRemove(guestThreadHandle, out _))
+        if (_interrupted.IsEmpty || guestThreadHandle == 0)
         {
             return;
         }
 
+        // Read the deliverer BEFORE consuming the flag. Consuming it while no
+        // deliverer is installed — a pre-first-Execute HLE wait, or a test —
+        // would drop the interrupt silently, and a dropped IL2CPP
+        // stop-the-world suspend is a lost wakeup that hangs the guest. Leaving
+        // the flag set means the next checkpoint with a deliverer still serves it.
         var deliver = DeliverInterruptForCurrentThread;
-        if (deliver is null)
+        if (deliver is null || !_interrupted.TryRemove(guestThreadHandle, out _))
         {
             return;
         }

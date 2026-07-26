@@ -1181,8 +1181,18 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		MarkExecutionProgress();
 		BindTlsBase(context);
 		var previousGuestThreadScheduler = GuestThreadExecution.Scheduler;
+		var previousInterruptDeliverer = GuestThreadBlocking.DeliverInterruptForCurrentThread;
 		GuestThreadExecution.Scheduler = this;
+
+		// The deliverer is restored alongside the scheduler below. Leaving it
+		// installed would outlive this Execute, so an in-process re-execution
+		// would deliver through a delegate bound to a previous backend instance.
 		GuestThreadBlocking.DeliverInterruptForCurrentThread = DeliverPendingGuestExceptionInPlaceForCurrentThread;
+
+		// TryExecute is multi-call in-process (per module initializer). The
+		// teardown flag is process-wide and otherwise set-only, so without this
+		// every in-place wait in a second session would unwind immediately.
+		GuestThreadBlocking.ResetShutdown();
 		try
 		{
 			if (!SetupImportStubs(importStubs))
@@ -1210,6 +1220,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			HostSessionControl.SetShutdownHandler(null);
 			GuestThreadExecution.Scheduler = previousGuestThreadScheduler;
+			GuestThreadBlocking.DeliverInterruptForCurrentThread = previousInterruptDeliverer;
 			Console.Error.WriteLine("[LOADER][INFO] === Execute END (LastError: " + (LastError ?? "null") + ") ===");
 		}
 	}
