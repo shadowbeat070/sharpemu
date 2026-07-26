@@ -40,14 +40,30 @@ public static class KernelPthreadCompatExports
 
     // Blocking model: waiters block their own host thread in place via
     // Monitor.Wait on the state object (mutexes) or SyncRoot (condvars).
-    // Block-and-wake is therefore atomic — no waiter queues, wake keys, or
-    // continuation hand-offs, and no lost-wakeup window between a thread
-    // deciding to block and registering as blocked.
+    // Block-and-wake is therefore atomic — no wake keys and no continuation
+    // hand-offs, and no lost-wakeup window between a thread deciding to block
+    // and registering as blocked.
+    //
+    // Mutexes additionally keep a FIFO of parked thread handles. Unlock does
+    // not leave the mutex free and let waiters race for it: it transfers
+    // ownership to the head of that FIFO and pulses, so acquisition order is
+    // the order threads blocked in. Ownership therefore moves directly from
+    // releaser to waiter, and the invariant OwnerThreadId == 0 implies an
+    // empty queue holds throughout.
     private sealed class PthreadMutexState
     {
         private long _ownerThreadId;
         private int _recursionCount;
         private int _queuedWaiterCount;
+
+        /// <summary>
+        /// Handles of threads parked in <see cref="PthreadMutexLockCore"/>, in
+        /// blocking order. Only ever touched under <c>lock (this)</c>. Entries
+        /// are removed by the releaser on hand-off, or by the waiter itself if
+        /// it unwinds before being granted, so a dead handle cannot linger at
+        /// the head and stall the queue.
+        /// </summary>
+        public LinkedList<ulong> WaiterQueue { get; } = new();
 
         public ulong OwnerThreadId
         {
@@ -174,9 +190,11 @@ public static class KernelPthreadCompatExports
                 state.OwnerThreadId = 0;
                 state.RecursionCount = 0;
 
-                // Waiters park in place on this monitor, so the pulse is the whole
-                // wake — no wake-key round trip through the scheduler is needed.
-                Monitor.PulseAll(state);
+                // Must hand off, not merely wake: parked waiters wait to be given
+                // ownership, so abandoning the mutex as "free" would strand every
+                // one of them. The hand-off pulse is the whole wake — no wake-key
+                // round trip through the scheduler is needed.
+                HandOffMutexLocked(state);
                 released++;
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] pthread_mutex_abandon mutex=0x{pair.Key:X16} " +
@@ -886,37 +904,69 @@ public static class KernelPthreadCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
             }
 
-            // Contended: block this host thread in place until the owner
-            // releases. Monitor.Wait atomically releases the state lock and
-            // parks, so an unlock's PulseAll cannot be missed. Waits are
-            // sliced only so teardown can unwind parked threads.
+            // Contended: join the FIFO and block this host thread in place until
+            // the releasing thread hands ownership over. Monitor.Wait atomically
+            // releases the state lock and parks, so the hand-off's PulseAll
+            // cannot be missed. Waits are sliced only so teardown can unwind
+            // parked threads.
             TracePthreadMutex(ctx, "lock-block", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
             GuestThreadBlocking.NoteBlocked(currentThreadId, "pthread_mutex_lock");
 
             // Register before re-reading the owner. A releaser that clears the
             // owner without the monitor (TryReleaseUncontended) re-reads the
             // waiter count afterwards, so either it observes this increment and
-            // pulses, or the loop below observes its release and never parks.
+            // takes the hand-off path, or the loop below observes its release
+            // and never parks.
+            var queueNode = state.WaiterQueue.AddLast(currentThreadId);
             state.WaiterAddedLocked();
+            var acquired = false;
             try
             {
-                while (state.OwnerThreadId != 0)
+                while (true)
                 {
+                    if (state.OwnerThreadId == currentThreadId)
+                    {
+                        // Handed off by the releaser, which set the owner and
+                        // recursion and dequeued us as one step under this monitor.
+                        acquired = true;
+                        break;
+                    }
+
+                    // A free mutex with a queued waiter is reachable: the
+                    // lock-free release can clear the owner and read the waiter
+                    // count just before this thread registered, so no hand-off is
+                    // coming. Claim it here rather than waiting for one. Only the
+                    // head may do so, which keeps the order FIFO.
+                    if (state.OwnerThreadId == 0 &&
+                        ReferenceEquals(state.WaiterQueue.First, queueNode))
+                    {
+                        state.WaiterQueue.Remove(queueNode);
+                        state.OwnerThreadId = currentThreadId;
+                        state.RecursionCount = 1;
+                        acquired = true;
+                        break;
+                    }
+
                     if (GuestThreadBlocking.ShutdownRequested)
                     {
                         TracePthreadMutex(ctx, "lock-shutdown", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN);
                         return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN;
                     }
 
+                    // Checkpoint drops the gate to run a queued guest exception,
+                    // so a hand-off can land while it is released; the loop's
+                    // re-test above picks that up before parking again.
                     GuestThreadBlocking.Checkpoint(currentThreadId, state);
                     _ = Monitor.Wait(state, GuestThreadBlocking.WaitSliceMilliseconds);
                 }
-
-                state.OwnerThreadId = currentThreadId;
-                state.RecursionCount = 1;
             }
             finally
             {
+                if (!acquired)
+                {
+                    state.WaiterQueue.Remove(queueNode);
+                }
+
                 state.WaiterRemovedLocked();
                 GuestThreadBlocking.NoteUnblocked(currentThreadId);
             }
@@ -924,6 +974,32 @@ public static class KernelPthreadCompatExports
             TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
+    }
+
+    /// <summary>
+    /// Transfers a just-released mutex to the head of its waiter FIFO, or leaves
+    /// it free when nobody is queued. The caller must hold <c>lock (state)</c>
+    /// and must have already dropped its own ownership.
+    /// </summary>
+    /// <remarks>
+    /// Handing ownership over rather than waking waiters to race for it is what
+    /// makes acquisition order FIFO. It also means the mutex is never observably
+    /// "free with a queued waiter", so a barging locker cannot slip in ahead of
+    /// a thread that has been waiting.
+    /// </remarks>
+    private static void HandOffMutexLocked(PthreadMutexState state)
+    {
+        if (state.WaiterQueue.First is { } head)
+        {
+            state.WaiterQueue.RemoveFirst();
+            state.OwnerThreadId = head.Value;
+            state.RecursionCount = 1;
+            Monitor.PulseAll(state);
+            return;
+        }
+
+        state.OwnerThreadId = 0;
+        state.RecursionCount = 0;
     }
 
     private static int PthreadMutexUnlockCore(CpuContext ctx, ulong mutexAddress, bool requireOwner)
@@ -955,12 +1031,18 @@ public static class KernelPthreadCompatExports
             {
                 // Re-read after releasing: a thread that registered as a waiter
                 // between TryReleaseUncontended's own check and the release above
-                // is already parked on the monitor, so it can only be woken here.
+                // is already parked on the monitor waiting to be handed the
+                // mutex, so only this path can still serve it.
                 if (state.QueuedWaiterCount != 0)
                 {
                     lock (state)
                     {
-                        Monitor.PulseAll(state);
+                        // Another thread may have taken the free mutex in the
+                        // meantime; it will hand off when it releases.
+                        if (state.OwnerThreadId == 0)
+                        {
+                            HandOffMutexLocked(state);
+                        }
                     }
                 }
 
@@ -987,19 +1069,9 @@ public static class KernelPthreadCompatExports
             if (state.RecursionCount == 0)
             {
                 state.OwnerThreadId = 0;
-
-                // No direct hand-off is needed. The cooperative path had to grant
-                // the mutex to the head waiter because a lost wake left it "free
-                // with a queued waiter" and wedged every later locker. Parked
-                // waiters now re-test the owner under this same monitor, so a wake
-                // carries no ownership token that can be lost.
-                if (state.QueuedWaiterCount != 0)
-                {
-                    Monitor.PulseAll(state);
-                }
+                HandOffMutexLocked(state);
             }
         }
-
 
         TracePthreadMutex(ctx, "unlock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;

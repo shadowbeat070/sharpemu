@@ -4328,13 +4328,90 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	// Upper bound on exceptions delivered back-to-back at one safe point. A
+	// handler that re-arms on every delivery would otherwise never let the
+	// thread resume guest work.
+	private const int MaxChainedGuestExceptionDeliveries = 8;
+
+	// Locates the guest's own per-thread exception record, purely so the
+	// delivery trace can report the stack bound the guest registered against
+	// the stack we actually delivered on. Unity's suspend callback keeps a
+	// 256-bucket table at this fixed image-relative offset from the callback
+	// entry; each node stores the pthread handle at +0x08 and the next
+	// pointer at +0x00. Diagnostics only — a miss just logs zeroes.
+	private static ulong FindGuestExceptionThreadRecord(
+		CpuContext context,
+		ulong callback,
+		ulong threadHandle)
+	{
+		if (callback < 65536)
+		{
+			return 0;
+		}
+
+		var tableAddress = callback + 0x102E8B0;
+		for (var bucket = 0; bucket < 256; bucket++)
+		{
+			if (!context.TryReadUInt64(tableAddress + unchecked((ulong)bucket * 8), out var node))
+			{
+				return 0;
+			}
+
+			for (var depth = 0; node >= 65536 && depth < 1024; depth++)
+			{
+				if (!context.TryReadUInt64(node + 0x08, out var registeredThread))
+				{
+					break;
+				}
+				if (registeredThread == threadHandle)
+				{
+					return node;
+				}
+				if (!context.TryReadUInt64(node, out node))
+				{
+					break;
+				}
+			}
+		}
+
+		return 0;
+	}
+
 	private void DeliverPendingGuestExceptionAtSafePoint(
+		CpuContext currentContext,
+		GuestCpuContinuation interruptedContinuation)
+	{
+		// A handler can queue another exception for this same thread (IL2CPP
+		// re-suspending while the first unwinds). The synchronous delivery path
+		// this replaced handed that follow-up straight on, so drain here rather
+		// than leaving it for the next safe point — a thread that goes back to
+		// parking may not reach one for a long time.
+		for (var delivery = 0; delivery < MaxChainedGuestExceptionDeliveries; delivery++)
+		{
+			if (!TryDeliverPendingGuestExceptionAtSafePoint(currentContext, interruptedContinuation))
+			{
+				return;
+			}
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][WARN] guest_exception.delivery_chain_capped " +
+			$"target=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+			$"limit={MaxChainedGuestExceptionDeliveries}");
+	}
+
+	/// <summary>
+	/// Delivers at most one queued exception for the current thread. Returns
+	/// true when one was delivered, so the caller can pick up a follow-up the
+	/// handler queued while it ran.
+	/// </summary>
+	private bool TryDeliverPendingGuestExceptionAtSafePoint(
 		CpuContext currentContext,
 		GuestCpuContinuation interruptedContinuation)
 	{
 		if (Volatile.Read(ref _pendingGuestExceptionCount) == 0)
 		{
-			return;
+			return false;
 		}
 
 		var threadHandle = GuestThreadExecution.CurrentGuestThreadHandle;
@@ -4347,16 +4424,24 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			if (threadHandle == 0)
 			{
-				return;
+				return false;
 			}
 
 			if (!TryRemovePendingGuestExceptionLocked(threadHandle, out pending))
 			{
-				return;
+				return false;
 			}
 
 			_activeGuestExceptionDeliveries.Add(threadHandle);
 		}
+
+		var logGuestExceptions = string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_EXCEPTIONS"),
+			"1",
+			StringComparison.Ordinal);
+		var deliveryStarted = Stopwatch.GetTimestamp();
+		var deliverySucceeded = false;
+		string? deliveryError = null;
 
 		const ulong exceptionContextSize = 0x500;
 		const ulong callbackStackOffset = 0x1000;
@@ -4370,16 +4455,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					interruptedContinuation,
 					exceptionContextSize))
 			{
+				deliveryError = "context write failed";
 				Console.Error.WriteLine(
 					$"[LOADER][ERROR] Guest exception safe-point context write failed: " +
 					$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2}");
-				return;
+				return true;
 			}
 
-			if (string.Equals(
-					Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_EXCEPTIONS"),
-					"1",
-					StringComparison.Ordinal))
+			if (logGuestExceptions)
 			{
 				Console.Error.WriteLine(
 					$"[LOADER][TRACE] guest_exception.safe_point_enter " +
@@ -4397,19 +4480,49 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					$"kernel exception 0x{pending.ExceptionType:X2} safe point",
 					out var callbackError))
 			{
+				deliveryError = callbackError ?? "unknown";
 				Console.Error.WriteLine(
 					$"[LOADER][ERROR] Guest exception safe-point delivery failed: " +
 					$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
-					$"error={callbackError ?? "unknown"}");
+					$"error={deliveryError}");
+			}
+			else
+			{
+				deliverySucceeded = true;
 			}
 		}
 		finally
 		{
+			if (logGuestExceptions)
+			{
+				var recordAddress = FindGuestExceptionThreadRecord(
+					currentContext,
+					pending.Handler,
+					threadHandle);
+				var recordedStack = 0UL;
+				var registeredStackBound = 0UL;
+				if (recordAddress != 0)
+				{
+					_ = currentContext.TryReadUInt64(recordAddress + 0x100, out registeredStackBound);
+					_ = currentContext.TryReadUInt64(recordAddress + 0x18, out recordedStack);
+				}
+
+				Console.Error.WriteLine(
+					$"[LOADER][TRACE] guest_exception.delivery_exit " +
+					$"target=0x{threadHandle:X16} type=0x{pending.ExceptionType:X2} " +
+					$"success={deliverySucceeded} error={deliveryError ?? "none"} " +
+					$"elapsed_ms={Stopwatch.GetElapsedTime(deliveryStarted).TotalMilliseconds:F3} " +
+					$"record=0x{recordAddress:X16} stack_bound=0x{registeredStackBound:X16} " +
+					$"recorded_rsp=0x{recordedStack:X16}");
+			}
+
 			lock (_guestThreadGate)
 			{
 				_activeGuestExceptionDeliveries.Remove(threadHandle);
 			}
 		}
+
+		return true;
 	}
 
 	private void QueuePendingGuestExceptionLocked(
