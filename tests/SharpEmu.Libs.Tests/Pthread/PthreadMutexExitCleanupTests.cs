@@ -38,11 +38,9 @@ public sealed class PthreadMutexExitCleanupTests
 
             _ = KernelPthreadCompatExports.AbandonMutexesForThread(DeadThread, "test_exit");
 
-            // The ghost waiter is gone and the survivor was handed the mutex,
-            // instead of being wedged behind a head that never wakes.
-            Assert.Equal(SurvivorThread, OwnerThreadId(state));
-            Assert.Equal(1, RecursionCount(state));
-            Assert.Equal(0, WaiterQueueLength(state));
+            // The ghost waiter is gone either way; what happens to the survivor
+            // depends on whether ownership is transferred or raced for.
+            AssertSuccessorServed(state);
         }
         finally
         {
@@ -63,9 +61,7 @@ public sealed class PthreadMutexExitCleanupTests
             var released = KernelPthreadCompatExports.AbandonMutexesForThread(DeadThread, "test_exit");
 
             Assert.Equal(1, released);
-            Assert.Equal(SurvivorThread, OwnerThreadId(state));
-            Assert.Equal(1, RecursionCount(state));
-            Assert.Equal(0, WaiterQueueLength(state));
+            AssertSuccessorServed(state);
         }
         finally
         {
@@ -114,6 +110,30 @@ public sealed class PthreadMutexExitCleanupTests
         {
             UnregisterMutex(address);
         }
+    }
+
+    // Whether unlock transfers ownership to the head waiter (the default) or
+    // leaves the mutex free for waiters to race for (SHARPEMU_MUTEX_HANDOFF=0).
+    // Both are supported, so the sweep's contract differs between them: the
+    // waiter is either granted the mutex or left queued on a free one, never
+    // stranded behind a dead head.
+    private static readonly bool HandOffEnabled = !string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_MUTEX_HANDOFF"),
+        "0",
+        StringComparison.Ordinal);
+
+    private static void AssertSuccessorServed(object state)
+    {
+        if (HandOffEnabled)
+        {
+            Assert.Equal(SurvivorThread, OwnerThreadId(state));
+            Assert.Equal(1, RecursionCount(state));
+            Assert.Equal(0, WaiterQueueLength(state));
+            return;
+        }
+
+        Assert.Equal(0UL, OwnerThreadId(state));
+        Assert.Equal([SurvivorThread], QueueContents(state));
     }
 
     // --- reflection helpers over the private synchronization internals ---

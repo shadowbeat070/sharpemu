@@ -88,7 +88,7 @@ public static class KernelPthreadCompatExports
         /// </summary>
         public bool TryAcquireUncontended(ulong threadId, bool allowWaiterBarge)
         {
-            if (!allowWaiterBarge && QueuedWaiterCount != 0)
+            if (!allowWaiterBarge && _mutexHandOff && QueuedWaiterCount != 0)
             {
                 return false;
             }
@@ -166,8 +166,57 @@ public static class KernelPthreadCompatExports
         // Abrupt worker-abort is not the only way a thread leaves a mutex
         // stranded: one that simply returns (or faults) while still owning it
         // never unlocks either.
-        GuestThreadExecution.GuestThreadExited +=
-            threadHandle => AbandonMutexesForThread(threadHandle, "thread_exit");
+        GuestThreadExecution.GuestThreadExited += ReleaseThreadSynchronizationStateOnExit;
+    }
+
+    /// <summary>
+    /// True once this host thread has entered a mutex path for the guest thread
+    /// it is currently running. Cleared when that guest thread exits, since host
+    /// worker threads are reused across guest threads.
+    /// </summary>
+    [ThreadStatic]
+    private static bool _threadTouchedMutex;
+
+    /// <summary>
+    /// Strict FIFO hand-off: unlock transfers ownership to the head waiter
+    /// rather than leaving the mutex free for whoever asks next.
+    /// </summary>
+    /// <remarks>
+    /// Fair, but every transfer is serialised through a wake — the mutex stays
+    /// owned by a still-sleeping thread for the whole scheduler latency, and a
+    /// thread that unlocks then immediately re-locks (the shape of most hot
+    /// critical sections) has to queue behind it. That convoys hot mutexes.
+    /// Setting SHARPEMU_MUTEX_HANDOFF=0 reverts to wake-and-race: ownership is
+    /// never transferred, any waiter may claim a free mutex, and the uncontended
+    /// fast path may barge. Provided to A/B a throughput regression against the
+    /// fairness this buys.
+    /// </remarks>
+    private static readonly bool _mutexHandOff = !string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_MUTEX_HANDOFF"),
+        "0",
+        StringComparison.Ordinal);
+
+    /// <summary>
+    /// Thread-exit cleanup. Unlike the worker-abort sweep this runs on <em>every</em>
+    /// guest thread termination, so it must not pay for a full mutex scan when
+    /// there is nothing to find: the overwhelmingly common case is a thread that
+    /// never touched a mutex at all, or unlocked everything it took.
+    /// </summary>
+    /// <remarks>
+    /// Safe to gate on a <c>[ThreadStatic]</c> because this runs on the exiting
+    /// guest thread's own host thread. The abort path cannot use it — there the
+    /// sweep is driven from the watchdog after the owner was terminated — so it
+    /// still scans unconditionally, which is fine as it is rare.
+    /// </remarks>
+    private static void ReleaseThreadSynchronizationStateOnExit(ulong threadHandle)
+    {
+        if (!_threadTouchedMutex)
+        {
+            return;
+        }
+
+        _threadTouchedMutex = false;
+        _ = AbandonMutexesForThread(threadHandle, "thread_exit");
     }
 
     /// <summary>
@@ -861,6 +910,12 @@ public static class KernelPthreadCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        // Deliberately a superset: any thread that reaches a mutex path at all is
+        // marked, so exit cleanup can never be skipped for a thread that owns or
+        // is queued on one. A thread-static store costs far less than the mutex
+        // scan it lets the common case avoid.
+        _threadTouchedMutex = true;
+
         if (!TryResolveMutexState(ctx, mutexAddress, createIfZero: true, out var resolvedAddress, out var state))
         {
             TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, null, KernelPthreadState.GetCurrentThreadHandle(), (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
@@ -947,7 +1002,7 @@ public static class KernelPthreadCompatExports
             // is free (owner==0). The blocking lock still defers to parked waiters
             // so they are not starved by a barging locker.
             if (state.OwnerThreadId == 0 &&
-                (tryOnly || state.QueuedWaiterCount == 0) &&
+                (tryOnly || !_mutexHandOff || state.QueuedWaiterCount == 0) &&
                 state.TryAcquireOwner(currentThreadId))
             {
                 TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
@@ -1022,12 +1077,16 @@ public static class KernelPthreadCompatExports
                     // count just before this thread registered, so no hand-off is
                     // coming. Claim it here rather than waiting for one. Only the
                     // head may do so, which keeps the order FIFO.
+                    // TryAcquireOwner, not a plain write: the uncontended fast
+                    // path CASes the owner from OUTSIDE this monitor, so a
+                    // barging trylock can take the mutex between the check above
+                    // and this claim. Writing ownership unconditionally would
+                    // clobber that thread's acquisition and leave two owners.
                     if (state.OwnerThreadId == 0 &&
-                        ReferenceEquals(state.WaiterQueue.First, queueNode))
+                        (!_mutexHandOff || ReferenceEquals(state.WaiterQueue.First, queueNode)) &&
+                        state.TryAcquireOwner(currentThreadId))
                     {
                         state.WaiterQueue.Remove(queueNode);
-                        state.OwnerThreadId = currentThreadId;
-                        state.RecursionCount = 1;
                         acquired = true;
                         break;
                     }
@@ -1077,17 +1136,35 @@ public static class KernelPthreadCompatExports
     /// </remarks>
     private static void HandOffMutexLocked(PthreadMutexState state)
     {
-        if (state.WaiterQueue.First is { } head)
+        if (!_mutexHandOff)
         {
-            state.WaiterQueue.RemoveFirst();
-            state.OwnerThreadId = head.Value;
-            state.RecursionCount = 1;
-            Monitor.PulseAll(state);
+            // Wake-and-race: the caller already released it; just wake the queue
+            // and let waiters contend. Do not write ownership here — a barger
+            // may already hold it.
+            if (state.QueuedWaiterCount != 0)
+            {
+                Monitor.PulseAll(state);
+            }
+
             return;
         }
 
-        state.OwnerThreadId = 0;
-        state.RecursionCount = 0;
+        if (state.WaiterQueue.First is { } head)
+        {
+            // CAS rather than assign: the caller has already released, so a
+            // barging trylock (which may bypass the waiter gate) can own the
+            // mutex by now. If it does, leave the head queued — the barger hands
+            // off to it on unlock — and pulse anyway so the head re-tests.
+            if (state.TryAcquireOwner(head.Value))
+            {
+                state.WaiterQueue.RemoveFirst();
+            }
+
+            Monitor.PulseAll(state);
+        }
+
+        // Nothing to do when the queue is empty: the caller already dropped its
+        // own ownership, and clearing it here would clobber a barger's.
     }
 
     private static int PthreadMutexUnlockCore(CpuContext ctx, ulong mutexAddress, bool requireOwner)
@@ -1602,6 +1679,10 @@ public static class KernelPthreadCompatExports
         uint timeoutUsec = 0,
         bool posixErrors = false)
     {
+        // Cond wait can adopt mutex ownership on entry without going through
+        // PthreadMutexLockCore, so mark here too.
+        _threadTouchedMutex = true;
+
         if (condAddress == 0 || mutexAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
