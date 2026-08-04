@@ -55,6 +55,35 @@ public static class NetExports
         return ctx.SetReturn(0);
     }
 
+    /// <summary>
+    /// Reports the console's ethernet address. Titles use it as a stable machine
+    /// identifier during network bring-up; returning a fixed locally-administered
+    /// address keeps that deterministic without leaking the host's real MAC.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "6Oc0bLsIYe0",
+        ExportName = "sceNetGetMacAddress",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNet")]
+    public static int NetGetMacAddress(CpuContext ctx)
+    {
+        var addressPointer = ctx[CpuRegister.Rdi];
+        if (addressPointer == 0)
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        // Locally-administered unicast (bit 1 of the first octet set, bit 0 clear).
+        ReadOnlySpan<byte> macAddress = [0x02, 0x53, 0x48, 0x45, 0x4D, 0x55];
+        if (!ctx.Memory.TryWrite(addressPointer, macAddress))
+        {
+            return ctx.SetReturn(NetErrorInvalidArgument);
+        }
+
+        TraceNet("get_mac_address", 0, 0, 0, 0);
+        return ctx.SetReturn(0);
+    }
+
     [SysAbiExport(
         Nid = "cTGkc6-TBlI",
         ExportName = "sceNetTerm",

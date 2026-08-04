@@ -77,6 +77,90 @@ public sealed class PthreadMutexSemanticsTests
     }
 
     [Fact]
+    public void MutexattrSettype_InvalidTypeIsRejectedAndLeavesAttributeUnchanged()
+    {
+        // Dead Space issues settype(attr, RECURSIVE) immediately followed by
+        // settype(attr, 0) against the same stack attr. Orbis mutex types are
+        // 1..4, so the 0 must fail without touching the attribute; folding it
+        // onto ERRORCHECK downgraded the mutex and self-deadlocked the title on
+        // its first recursive re-lock.
+        const ulong memoryBase = 0x1_0007_0000;
+        const ulong attrAddress = memoryBase + 0x100;
+        const ulong mutexAddress = memoryBase + 0x200;
+        var memory = new AllocatingCpuMemory(memoryBase, 0x4000);
+        var context = new CpuContext(memory, Generation.Gen5);
+
+        context[CpuRegister.Rdi] = attrAddress;
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexattrInit(context));
+
+        context[CpuRegister.Rsi] = 2; // SCE_PTHREAD_MUTEX_RECURSIVE
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexattrSettype(context));
+
+        context[CpuRegister.Rdi] = attrAddress;
+        context[CpuRegister.Rsi] = 0; // Not a valid Orbis mutex type.
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT,
+            KernelPthreadCompatExports.PthreadMutexattrSettype(context));
+
+        context[CpuRegister.Rdi] = mutexAddress;
+        context[CpuRegister.Rsi] = attrAddress;
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexInit(context));
+
+        // Still recursive: re-locking and trylock from the owning thread succeed.
+        context[CpuRegister.Rdi] = mutexAddress;
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(context));
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexTrylock(context));
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+        Assert.NotEqual(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+    }
+
+    [Fact]
+    public async Task AbandonedMutex_GrantsAndWakesQueuedHostWaiter()
+    {
+        // A guest thread torn down while holding a mutex used to strand host-side
+        // waiters: the abandon path pulsed an unrelated monitor and only ever
+        // published a wake key for a *cooperative* head waiter, while
+        // WaitForHostMutexLock parks on HostSignal with no timeout.
+        const ulong memoryBase = 0x2_0001_0000;
+        const ulong mutexAddress = memoryBase + 0x100;
+        var memory = new AllocatingCpuMemory(memoryBase, 0x4000);
+        var ownerContext = new CpuContext(memory, Generation.Gen5);
+        Assert.True(ownerContext.TryWriteUInt64(mutexAddress, 1));
+        ownerContext[CpuRegister.Rdi] = mutexAddress;
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(ownerContext));
+        var ownerHandle = KernelPthreadState.GetCurrentThreadHandle();
+
+        using var waiterStarted = new ManualResetEventSlim(false);
+        var waiter = Task.Factory.StartNew(
+            () =>
+            {
+                var waiterContext = new CpuContext(memory, Generation.Gen5);
+                waiterContext[CpuRegister.Rdi] = mutexAddress;
+                waiterStarted.Set();
+                var lockResult = KernelPthreadCompatExports.PthreadMutexLock(waiterContext);
+                if (lockResult != 0)
+                {
+                    return (lockResult, int.MinValue);
+                }
+
+                return (lockResult, KernelPthreadCompatExports.PthreadMutexUnlock(waiterContext));
+            },
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
+
+        Assert.True(waiterStarted.Wait(TimeSpan.FromSeconds(5)));
+        Thread.Sleep(50); // Let the waiter enqueue and park on its host signal.
+        Assert.False(waiter.IsCompleted);
+
+        Assert.True(KernelPthreadCompatExports.AbandonMutexesOwnedByThread(ownerHandle, "test") >= 1);
+
+        var result = await waiter.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal((0, 0), result);
+    }
+
+    [Fact]
     public async Task ContendedMutex_HandsOffOneHostWaiterAtATime()
     {
         const ulong memoryBase = 0x2_0000_0000;

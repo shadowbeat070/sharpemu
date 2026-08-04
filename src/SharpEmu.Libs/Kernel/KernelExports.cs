@@ -48,6 +48,26 @@ public static class KernelExports
     }
 
     [SysAbiExport(
+        Nid = "fFkhOgztiCA",
+        ExportName = "sceCoredumpUnregisterCoredumpHandler",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceCoredump")]
+    public static int CoredumpUnregisterHandler(CpuContext ctx)
+    {
+        // Takes no arguments; drops whatever RegisterCoredumpHandler stored.
+        // Titles call this on the way out of main, so a missing registration is
+        // not an error worth failing the teardown over.
+        lock (_coredumpGate)
+        {
+            _coredumpHandler = 0;
+            _coredumpHandlerContext = 0;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "uMei1W9uyNo",
         ExportName = "exit",
         Target = Generation.Gen4 | Generation.Gen5,

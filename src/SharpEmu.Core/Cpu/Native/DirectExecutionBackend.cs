@@ -14,6 +14,7 @@ using SharpEmu.Core.Loader;
 using SharpEmu.Core.Memory;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Diagnostics;
+using SharpEmu.Libs.Kernel;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -2929,7 +2930,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int hostPauseJump = offset;
 		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4C);
+		// REX.B must be set so ModRM rm=001 selects r9 (the lock) rather than rcx:
+		// 0x4C (W|R) targeted [rcx], so the CAS could never match the owner word
+		// loaded from [r9] and the acquire spun forever.
+		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4D);
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11); // lock cmpxchg [r9], r10
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int hostRetryJump = offset;
@@ -3012,8 +3016,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int guestPauseJump = offset;
 		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4C);
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11);
+		// REX.B as above: 0x4D targets [r9]; 0x4C would CAS [rcx].
+		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4D);
+		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11); // lock cmpxchg [r9], r10
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int guestRetryJump = offset;
 		EmitUInt32(code, ref offset, 0u);
@@ -3147,6 +3152,23 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
         const ulong MaxScanBytes = 134217728uL;
 		ulong num = _entryPoint;
 		ulong num2 = num + MaxScanBytes;
+
+		foreach (var moduleHandle in KernelModuleRegistry.GetModuleHandles(includeSystemModules: true))
+		{
+			if (!KernelModuleRegistry.TryGetModuleByHandle(moduleHandle, out var module) ||
+				module.BaseAddress == 0 || module.EndAddress <= module.BaseAddress)
+			{
+				continue;
+			}
+			if (module.BaseAddress < num)
+			{
+				num = module.BaseAddress;
+			}
+			if (module.EndAddress > num2)
+			{
+				num2 = module.EndAddress;
+			}
+		}
 		int num3 = 0;
 		int num4 = 0;
 		int num9 = 0;

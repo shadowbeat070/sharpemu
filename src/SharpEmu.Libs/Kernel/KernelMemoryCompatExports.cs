@@ -5452,16 +5452,26 @@ public static partial class KernelMemoryCompatExports
     {
         const string hostappVariableName = "SHARPEMU_HOSTAPP_DIR";
         var configuredRoot = Environment.GetEnvironmentVariable(hostappVariableName);
-        string root;
         if (!string.IsNullOrWhiteSpace(configuredRoot))
         {
-            root = Path.GetFullPath(configuredRoot);
-        }
-        else
-        {
-            root = Path.Combine(ResolveGameLogRoot(), "hostapp");
+            var explicitRoot = Path.GetFullPath(configuredRoot);
+            Directory.CreateDirectory(explicitRoot);
+            return explicitRoot;
         }
 
+        // /hostapp is the application image itself on a devkit, so for a dump it
+        // is the same tree as /app0 - and IsReadOnlyGuestStatPath already groups
+        // the two. Defaulting it to an empty scratch directory under the log root
+        // made every /hostapp lookup miss: Dead Space probes
+        // /hostapp/Data/chunkmanifest and /hostapp/Data/layout.toc for its
+        // Frostbite data, found nothing, and returned cleanly out of main().
+        var app0Root = ResolveApp0Root();
+        if (!string.IsNullOrWhiteSpace(app0Root) && Directory.Exists(app0Root))
+        {
+            return app0Root;
+        }
+
+        var root = Path.Combine(ResolveGameLogRoot(), "hostapp");
         Directory.CreateDirectory(root);
         return root;
     }

@@ -116,6 +116,39 @@ public static class NpManagerExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    /// <summary>
+    /// Drops a callback registered through sceNpRegisterStateCallbackA. The
+    /// register side is already a silent accept, so unregistering is simply a
+    /// success; leaving the NID unresolved made Dead Space carry on through its
+    /// NP teardown with a half-populated dispatch record and later call through
+    /// a function pointer that had never been written.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "M3wFXbYQtAA",
+        ExportName = "sceNpUnregisterStateCallbackA",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpManager")]
+    public static int NpUnregisterStateCallbackA(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    /// <summary>
+    /// Counterpart to sceNpRegisterNpReachabilityStateCallback, which accepts
+    /// the callback and never fires it on an offline session.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "cRILAEvn+9M",
+        ExportName = "sceNpUnregisterNpReachabilityStateCallback",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpManager")]
+    public static int NpUnregisterNpReachabilityStateCallback(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     [SysAbiExport(
         Nid = "0c7HbXRKUt4",
         ExportName = "sceNpRegisterStateCallbackForToolkit",

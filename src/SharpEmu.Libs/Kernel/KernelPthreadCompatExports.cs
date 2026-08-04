@@ -93,11 +93,26 @@ public static class KernelPthreadCompatExports
 
         public bool TryReleaseUncontended(ulong threadId)
         {
+            // Confirm ownership before touching the recursion count. Only the
+            // owning thread can release a mutex and no other thread can make us
+            // the owner, so once this holds the fields below are ours alone to
+            // move. Without the check a non-owner would zero (and then restore)
+            // the recursion count belonging to whichever thread actually held the
+            // mutex, clobbering a recursive hold that had advanced past 1.
+            if (threadId == 0 || OwnerThreadId != threadId)
+            {
+                return false;
+            }
+
             if (QueuedWaiterCount != 0 || RecursionCount != 1)
             {
                 return false;
             }
 
+            // Recursion count first, then the owner CAS. The owner field is the
+            // gate that keeps other threads out, so releasing it first would let a
+            // new owner acquire and then have its recursion count overwritten by
+            // the store below.
             Volatile.Write(ref _recursionCount, 0);
             if (Interlocked.CompareExchange(
                     ref _ownerThreadId,
@@ -178,7 +193,14 @@ public static class KernelPthreadCompatExports
         {
             var state = pair.Value;
             string? wakeKey = null;
-            lock (state)
+            var waiterCount = 0;
+            // Every other mutex path (lock, unlock, cond hand-off) serializes on
+            // state.SyncRoot. Taking `lock (state)` here guarded an unrelated
+            // monitor, so an abandon could run concurrently with a lock/unlock and
+            // tear OwnerThreadId/RecursionCount apart. The matching Monitor.PulseAll
+            // was dead too: nothing ever waits on that monitor, because mutex
+            // waiters park on HostSignal or the guest scheduler.
+            lock (state.SyncRoot)
             {
                 if (state.OwnerThreadId != threadId || state.RecursionCount <= 0)
                 {
@@ -187,16 +209,36 @@ public static class KernelPthreadCompatExports
 
                 state.OwnerThreadId = 0;
                 state.RecursionCount = 0;
-                wakeKey = state.Waiters.First?.Value.Cooperative == true
-                    ? state.Waiters.First.Value.WakeKey
-                    : null;
-                Monitor.PulseAll(state);
+                waiterCount = state.Waiters.Count;
+
+                // Hand the mutex to the head waiter instead of merely waking it,
+                // for the reason PthreadMutexUnlockCore documents: a waiter that is
+                // woken but not granted leaves the mutex "free with a queued
+                // waiter", which the fast-acquire path refuses, so every later
+                // locker queues behind a head that never advances. The previous
+                // code also only published a wake key for a *cooperative* head and
+                // left host-side waiters parked on HostSignal forever.
+                if (state.Waiters.First is { } headNode &&
+                    TryGrantMutexWaiterLocked(state, headNode.Value))
+                {
+                    var nextWaiter = headNode.Value;
+                    if (nextWaiter.Cooperative)
+                    {
+                        wakeKey = nextWaiter.WakeKey;
+                    }
+                    else
+                    {
+                        nextWaiter.HostSignal!.Set();
+                    }
+                }
+
                 released++;
-                Console.Error.WriteLine(
-                    $"[LOADER][WARN] pthread_mutex_abandon mutex=0x{pair.Key:X16} " +
-                    $"owner={KernelPthreadState.DescribeThreadHandle(threadId)} " +
-                    $"reason={reason} waiters={state.Waiters.Count}");
             }
+
+            Console.Error.WriteLine(
+                $"[LOADER][WARN] pthread_mutex_abandon mutex=0x{pair.Key:X16} " +
+                $"owner={KernelPthreadState.DescribeThreadHandle(threadId)} " +
+                $"reason={reason} waiters={waiterCount}");
 
             if (wakeKey is not null)
             {
@@ -770,6 +812,14 @@ public static class KernelPthreadCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        if (_tracePthreads)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] pthread_mutex_init: mutex=0x{mutexAddress:X16} " +
+                $"attr=0x{attrAddress:X16} handle=0x{handle:X16} " +
+                $"type={state.Type} protocol={state.Protocol}");
+        }
+
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -1131,6 +1181,27 @@ public static class KernelPthreadCompatExports
         }
 
         var resolvedAddress = ResolveMutexAttrHandle(ctx, attrAddress);
+
+        // Orbis mutex types are 1..4 and PTHREAD_MUTEX_DEFAULT is ERRORCHECK, so
+        // 0 (and anything past ADAPTIVE_NP) is not a valid type. POSIX requires an
+        // unsuccessful settype to leave the attribute unchanged; folding invalid
+        // values onto ERRORCHECK instead silently downgraded already-configured
+        // attributes. Dead Space issues settype(attr, RECURSIVE) immediately
+        // followed by settype(attr, 0) against the same attr, so the clobber made
+        // every mutex built from it ERRORCHECK and self-deadlocked the title on
+        // the first recursive re-lock.
+        if (!IsValidMutexType(type))
+        {
+            if (_tracePthreads)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] pthread_mutexattr_settype: attr=0x{attrAddress:X16} " +
+                    $"resolved=0x{resolvedAddress:X16} requested={type} rejected=invalid_type");
+            }
+
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
         PthreadMutexAttrState updatedState;
         lock (_stateGate)
         {
@@ -1145,6 +1216,13 @@ public static class KernelPthreadCompatExports
             {
                 _mutexAttrStates[attrAddress] = updatedState;
             }
+        }
+
+        if (_tracePthreads)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] pthread_mutexattr_settype: attr=0x{attrAddress:X16} " +
+                $"resolved=0x{resolvedAddress:X16} requested={type} stored={updatedState.Type}");
         }
 
         return WriteMutexAttrObject(ctx, resolvedAddress, updatedState)
@@ -2045,6 +2123,9 @@ public static class KernelPthreadCompatExports
 
         return TimeSpan.FromSeconds(remainingTicks / (double)Stopwatch.Frequency);
     }
+
+    private static bool IsValidMutexType(int type) =>
+        type is >= MutexTypeErrorCheck and <= MutexTypeAdaptiveNp;
 
     private static int NormalizeMutexType(int type)
     {
